@@ -1466,7 +1466,7 @@ func (a *App) refocusCurrent() {
 func (a *App) executeUserCommand(name string, cfg config.CommandConfig, args []string) {
 	cmdCtx := a.buildCommandContext(args)
 
-	expandedCmd, err := command.ExpandCmd(cfg.Cmd, cmdCtx)
+	inv, err := command.ExpandCmd(cfg.Cmd, cmdCtx)
 	if err != nil {
 		a.toasts.Error(fmt.Sprintf("Command %q: %s", name, err))
 		a.refocusCurrent()
@@ -1474,22 +1474,22 @@ func (a *App) executeUserCommand(name string, cfg config.CommandConfig, args []s
 	}
 
 	// Inject connection flags for temporal CLI commands
-	expandedCmd = command.InjectConnectionFlags(expandedCmd, cmdCtx)
+	inv = command.InjectConnectionFlags(inv, cmdCtx)
 
 	if cfg.Confirm {
-		a.showCommandConfirm(name, cfg, expandedCmd)
+		a.showCommandConfirm(name, cfg, inv)
 		return
 	}
 
-	a.runCommand(name, expandedCmd, cfg)
+	a.runCommand(name, inv, cfg)
 }
 
 // showCommandConfirm shows a confirmation modal before executing a command.
-func (a *App) showCommandConfirm(name string, cfg config.CommandConfig, expandedCmd string) {
+func (a *App) showCommandConfirm(name string, cfg config.CommandConfig, inv command.Invocation) {
 	form := components.NewFormBuilder().
 		OnSubmit(func(values map[string]any) {
 			a.app.Pages().DismissModal()
-			a.runCommand(name, expandedCmd, cfg)
+			a.runCommand(name, inv, cfg)
 		}).
 		OnCancel(func() {
 			a.app.Pages().DismissModal()
@@ -1508,7 +1508,7 @@ func (a *App) showCommandConfirm(name string, cfg config.CommandConfig, expanded
 	infoText.SetBackgroundColor(theme.Bg())
 	infoText.SetText(fmt.Sprintf("[%s]Command:[-] [%s]%s[-]\n\n[%s]%s[-]",
 		theme.TagFgDim(), theme.TagAccent(), name,
-		theme.TagFg(), expandedCmd))
+		theme.TagFg(), inv.Display))
 
 	contentFlex.AddItem(infoText, 4, 0, false)
 	contentFlex.AddItem(form, 0, 1, true)
@@ -1535,7 +1535,7 @@ func (a *App) showCommandConfirm(name string, cfg config.CommandConfig, expanded
 }
 
 // runCommand dispatches to the appropriate output handler based on config.
-func (a *App) runCommand(name, expandedCmd string, cfg config.CommandConfig) {
+func (a *App) runCommand(name string, inv command.Invocation, cfg config.CommandConfig) {
 	outputType := cfg.Output
 	if outputType == "" {
 		outputType = config.OutputLog
@@ -1543,20 +1543,20 @@ func (a *App) runCommand(name, expandedCmd string, cfg config.CommandConfig) {
 
 	switch outputType {
 	case config.OutputLog:
-		a.runCommandLog(name, expandedCmd, cfg)
+		a.runCommandLog(name, inv, cfg)
 	case config.OutputJSON:
-		a.runCommandJSON(name, expandedCmd, cfg)
+		a.runCommandJSON(name, inv, cfg)
 	case config.OutputWorkflows:
-		a.runCommandWorkflows(name, expandedCmd, cfg)
+		a.runCommandWorkflows(name, inv, cfg)
 	case config.OutputWorkflow:
-		a.runCommandWorkflow(name, expandedCmd, cfg)
+		a.runCommandWorkflow(name, inv, cfg)
 	default:
-		a.runCommandLog(name, expandedCmd, cfg)
+		a.runCommandLog(name, inv, cfg)
 	}
 }
 
 // runCommandLog creates a CommandOutputView with LogViewer, pushes it, and streams output.
-func (a *App) runCommandLog(name, expandedCmd string, cfg config.CommandConfig) {
+func (a *App) runCommandLog(name string, inv command.Invocation, cfg config.CommandConfig) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	lv := components.NewLogViewer()
@@ -1572,10 +1572,10 @@ func (a *App) runCommandLog(name, expandedCmd string, cfg config.CommandConfig) 
 	go func() {
 		lv.AddEntry(components.LogEntry{
 			Level:   components.LogLevelInfo,
-			Message: "$ " + expandedCmd,
+			Message: "$ " + inv.Display,
 		})
 
-		err := command.RunStreaming(ctx, expandedCmd, func(line string) {
+		err := command.RunStreaming(ctx, inv, func(line string) {
 			a.app.QueueUpdateDraw(func() {
 				lv.AddEntry(components.LogEntry{
 					Level:   components.LogLevelInfo,
@@ -1601,7 +1601,7 @@ func (a *App) runCommandLog(name, expandedCmd string, cfg config.CommandConfig) 
 }
 
 // runCommandJSON runs a command and displays the result in a CodeView with JSON highlighting.
-func (a *App) runCommandJSON(name, expandedCmd string, cfg config.CommandConfig) {
+func (a *App) runCommandJSON(name string, inv command.Invocation, cfg config.CommandConfig) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	cv := components.NewCodeView().SetLanguage(components.LangJSON)
@@ -1617,7 +1617,7 @@ func (a *App) runCommandJSON(name, expandedCmd string, cfg config.CommandConfig)
 	a.app.SetFocus(cv)
 
 	go func() {
-		output, err := command.Run(ctx, expandedCmd)
+		output, err := command.Run(ctx, inv)
 		a.app.QueueUpdateDraw(func() {
 			if err != nil && ctx.Err() == nil {
 				cv.SetCode(fmt.Sprintf("Error: %s\n\n%s", err, output))
@@ -1631,12 +1631,12 @@ func (a *App) runCommandJSON(name, expandedCmd string, cfg config.CommandConfig)
 }
 
 // runCommandWorkflows runs a command, parses JSONL output, and pushes a WorkflowList.
-func (a *App) runCommandWorkflows(name, expandedCmd string, _ config.CommandConfig) {
+func (a *App) runCommandWorkflows(name string, inv command.Invocation, _ config.CommandConfig) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		output, runErr := command.Run(ctx, expandedCmd)
+		output, runErr := command.Run(ctx, inv)
 
 		// Try to parse output even on non-zero exit (CLI may still produce valid JSONL)
 		workflows, parseErr := command.ParseWorkflowsOutput(output)
@@ -1662,12 +1662,12 @@ func (a *App) runCommandWorkflows(name, expandedCmd string, _ config.CommandConf
 }
 
 // runCommandWorkflow runs a command, parses workflow ID/run ID, and navigates to WorkflowDetail.
-func (a *App) runCommandWorkflow(name, expandedCmd string, _ config.CommandConfig) {
+func (a *App) runCommandWorkflow(name string, inv command.Invocation, _ config.CommandConfig) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		output, runErr := command.Run(ctx, expandedCmd)
+		output, runErr := command.Run(ctx, inv)
 
 		workflowID, runID, parseErr := command.ParseWorkflowOutput(output)
 		if parseErr != nil {
