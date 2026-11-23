@@ -440,47 +440,7 @@ func (a *App) Run() error {
 		go a.connectionMonitor()
 	}
 
-	// Check for updates if enabled
-	if a.config != nil && a.config.ShouldCheckUpdates() {
-		go a.checkForUpdates()
-	}
-
 	return a.app.Run()
-}
-
-// checkForUpdates checks for updates and automatically applies them.
-func (a *App) checkForUpdates() {
-	// Skip auto-update for Homebrew installs - use `brew upgrade` instead
-	if update.IsHomebrewInstall() {
-		return
-	}
-
-	updater := update.NewUpdater()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	info, err := updater.CheckForUpdate(ctx)
-	if err != nil {
-		// Silent failure - don't bother user with update check errors
-		return
-	}
-
-	if !info.NeedsUpdate {
-		return
-	}
-
-	// Apply update automatically
-	updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer updateCancel()
-
-	if err := updater.ApplyUpdate(updateCtx, info); err != nil {
-		return
-	}
-
-	a.app.QueueUpdateDraw(func() {
-		a.toasts.Success("Updated, restart plz " + theme.IconHeart)
-	})
 }
 
 // ShowToastError displays an error toast notification.

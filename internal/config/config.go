@@ -136,7 +136,6 @@ type Config struct {
 	Profiles         map[string]ConnectionConfig `yaml:"profiles,omitempty"`
 	ExternalProfiles map[string]ConnectionConfig `yaml:"-"`
 	SavedFilters     []SavedFilter               `yaml:"saved_filters,omitempty"`
-	CheckUpdates     *bool                       `yaml:"check_updates,omitempty"`
 	HelpStyle        string                      `yaml:"help_style,omitempty"` // "modal" (default) or "sheet"
 	Commands         map[string]CommandConfig    `yaml:"commands,omitempty"`
 }
@@ -158,15 +157,6 @@ func (c *Config) GetHelpStyle() string {
 		return "sheet"
 	}
 	return "modal"
-}
-
-// ShouldCheckUpdates returns whether update checking is enabled.
-// Defaults to true if not explicitly set.
-func (c *Config) ShouldCheckUpdates() bool {
-	if c.CheckUpdates == nil {
-		return true
-	}
-	return *c.CheckUpdates
 }
 
 // DefaultConfig returns a config with default values.

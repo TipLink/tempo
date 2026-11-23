@@ -1,6 +1,8 @@
 package update
 
 import (
+	"fmt"
+	"runtime"
 	"runtime/debug"
 	"strings"
 )
@@ -42,4 +44,10 @@ func init() {
 			}
 		}
 	}
+}
+
+// GetVersionInfo returns formatted version information.
+func GetVersionInfo() string {
+	return fmt.Sprintf("tempo %s (%s/%s)\nCommit: %s\nBuilt: %s",
+		Version, runtime.GOOS, runtime.GOARCH, Commit, BuildDate)
 }
