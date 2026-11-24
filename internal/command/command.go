@@ -121,6 +121,7 @@ func parseHeredoc(rest string) (h heredoc, consumed int, ok bool) {
 	}
 
 	var word strings.Builder
+	start := j
 scan:
 	for j < len(rest) {
 		ch := rest[j]
@@ -145,10 +146,11 @@ scan:
 		}
 	}
 
-	h.delimiter = word.String()
-	if h.delimiter == "" {
+	// A quoted delimiter may be empty; the body then ends at an empty line.
+	if j == start {
 		return heredoc{}, 0, false
 	}
+	h.delimiter = word.String()
 	return h, j, true
 }
 

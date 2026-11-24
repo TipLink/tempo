@@ -476,6 +476,7 @@ func TestExpandCmdRejectsPlaceholdersInLiteralHeredocs(t *testing.T) {
 		"cat <<'EOF'\n{workflow_id}\nEOF",
 		"cat <<\"EOF\"\n{workflow_id}\nEOF",
 		"cat <<\\EOF\n{workflow_id}\nEOF",
+		"cat <<''\n{workflow_id}\n\n",
 	} {
 		_, err := ExpandCmd(template, ctx)
 		want := "variable {workflow_id} cannot be used in a here-document with a quoted delimiter"
@@ -493,6 +494,22 @@ func TestExpandCmdRejectsPlaceholdersInLiteralHeredocs(t *testing.T) {
 		t.Fatalf("Run: %v\n%s", err, out)
 	}
 	if want := "{literal} $(not run)\norder-42"; out != want {
+		t.Errorf("output = %q, want %q", out, want)
+	}
+
+	// An empty quoted delimiter ends the body at the first empty line.
+	inv, err = ExpandCmd("cat <<''\nliteral $(not run)\n\nprintf '%s' {workflow_id}", ctx)
+	if err != nil {
+		t.Fatalf("ExpandCmd: %v", err)
+	}
+	if want := "cat <<''\nliteral $(not run)\n\nprintf '%s' \"${TEMPO_WORKFLOW_ID}\""; inv.Script != want {
+		t.Errorf("script = %q, want %q", inv.Script, want)
+	}
+	out, err = Run(context.Background(), inv)
+	if err != nil {
+		t.Fatalf("Run: %v\n%s", err, out)
+	}
+	if want := "literal $(not run)\norder-42"; out != want {
 		t.Errorf("output = %q, want %q", out, want)
 	}
 }
