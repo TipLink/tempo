@@ -62,8 +62,49 @@ func TestExpandCmdReferencesValuesThroughEnvironment(t *testing.T) {
 			name:     "escaped brace stays literal",
 			template: `echo \{workflow_id} {workflow_id}`,
 			script:   `echo \{workflow_id} "${TEMPO_WORKFLOW_ID}"`,
-			display:  `echo \{workflow_id} order-42`,
+			display:  `echo {workflow_id} order-42`,
 			env:      []string{"TEMPO_WORKFLOW_ID=order-42"},
+		},
+		{
+			name:     "escaped brace inside single quotes",
+			template: `printf '%s\n' '\{not_a_variable}' '{workflow_id}'`,
+			script:   `printf '%s\n' '{not_a_variable}' ''"${TEMPO_WORKFLOW_ID}"''`,
+			display:  `printf '%s\n' '{not_a_variable}' 'order-42'`,
+			env:      []string{"TEMPO_WORKFLOW_ID=order-42"},
+		},
+		{
+			name:     "escaped brace inside double quotes",
+			template: `echo "\{not_a_variable}"`,
+			script:   `echo "{not_a_variable}"`,
+			display:  `echo "{not_a_variable}"`,
+		},
+		{
+			name:     "command substitution has its own quoting",
+			template: `printf '%s' "$(printf '%s' '{workflow_id}' {namespace})"`,
+			script:   `printf '%s' "$(printf '%s' ''"${TEMPO_WORKFLOW_ID}"'' "${TEMPO_NAMESPACE}")"`,
+			display:  `printf '%s' "$(printf '%s' 'order-42' payments)"`,
+			env:      []string{"TEMPO_WORKFLOW_ID=order-42", "TEMPO_NAMESPACE=payments"},
+		},
+		{
+			name:     "outer quoting resumes after a command substitution",
+			template: `echo "$(date "+%s") {workflow_id}" {namespace}`,
+			script:   `echo "$(date "+%s") ${TEMPO_WORKFLOW_ID}" "${TEMPO_NAMESPACE}"`,
+			display:  `echo "$(date "+%s") order-42" payments`,
+			env:      []string{"TEMPO_WORKFLOW_ID=order-42", "TEMPO_NAMESPACE=payments"},
+		},
+		{
+			name:     "parentheses inside a command substitution",
+			template: `echo "$( (echo {workflow_id}) ) {namespace}"`,
+			script:   `echo "$( (echo "${TEMPO_WORKFLOW_ID}") ) ${TEMPO_NAMESPACE}"`,
+			display:  `echo "$( (echo order-42) ) payments"`,
+			env:      []string{"TEMPO_WORKFLOW_ID=order-42", "TEMPO_NAMESPACE=payments"},
+		},
+		{
+			name:     "backticks have their own quoting",
+			template: "echo \"`printf '%s' {workflow_id}` {namespace}\"",
+			script:   "echo \"`printf '%s' \"${TEMPO_WORKFLOW_ID}\"` ${TEMPO_NAMESPACE}\"",
+			display:  "echo \"`printf '%s' order-42` payments\"",
+			env:      []string{"TEMPO_WORKFLOW_ID=order-42", "TEMPO_NAMESPACE=payments"},
 		},
 		{
 			name:     "repeated placeholder is recorded once",
@@ -140,7 +181,8 @@ func TestRunNeverExecutesSubstitutedValues(t *testing.T) {
 		{"double-quoted", `printf '%s' "{workflow_id}"`, true},
 		{"single-quoted", `printf '%s' '{workflow_id}'`, true},
 		{"positional argument", `printf '%s' {1}`, true},
-		{"inside command substitution", `echo "$(printf '%s' {workflow_id})"`, false},
+		{"inside command substitution", `printf '%s' "$(printf '%s' {workflow_id})"`, true},
+		{"quoted inside command substitution", `printf '%s' "$(printf '%s' '{workflow_id}')"`, true},
 		{"inside backticks", "echo `printf '%s' {workflow_id}`", false},
 	}
 
@@ -167,6 +209,73 @@ func TestRunNeverExecutesSubstitutedValues(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// The shell evaluates a value used in arithmetic, and bash runs command
+// substitutions found in an array subscript there, so only integers may pass.
+func TestExpandCmdAllowsOnlyIntegersInArithmetic(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "executed")
+
+	templates := []struct {
+		name     string
+		template string
+		// run reports whether the template is portable enough to execute.
+		run  bool
+		want string
+	}{
+		{"unquoted", `echo $(( {1} + 1 ))`, true, "3\n"},
+		{"double-quoted", `echo "$(( {1} + 1 ))"`, true, "3\n"},
+		{"grouped", `echo $(( ({1} + 1) * 2 ))`, true, "6\n"},
+		{"substitution inside arithmetic", `echo $(( $(printf '%s' {1}) + 1 ))`, true, "3\n"},
+		{"arithmetic command", `(( {1} > 1 )) && echo yes`, false, ""},
+	}
+	hostileValues := []string{
+		"probe[$(touch " + marker + ")0]",
+		"$(touch " + marker + ")",
+		"2; touch " + marker,
+		"1 + 1",
+		"two",
+	}
+
+	for _, tt := range templates {
+		t.Run(tt.name, func(t *testing.T) {
+			inv, err := ExpandCmd(tt.template, Context{Args: []string{"2"}})
+			if err != nil {
+				t.Fatalf("ExpandCmd with an integer: %v", err)
+			}
+			if tt.run {
+				out, err := Run(context.Background(), inv)
+				if err != nil {
+					t.Fatalf("Run: %v\n%s", err, out)
+				}
+				if out != tt.want {
+					t.Errorf("output = %q, want %q", out, tt.want)
+				}
+			}
+
+			for _, hostile := range hostileValues {
+				_, err := ExpandCmd(tt.template, Context{Args: []string{hostile}})
+				want := "variable {1} must be an integer inside an arithmetic expression"
+				if err == nil || err.Error() != want {
+					t.Errorf("value %q: error = %v, want %q", hostile, err, want)
+				}
+			}
+		})
+	}
+
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("a value was executed as shell code")
+	}
+}
+
+func TestExpandCmdLeavesArithmeticRuleAtTheClosingParentheses(t *testing.T) {
+	inv, err := ExpandCmd(`echo $(( {1} + 1 )) {workflow_id}`, Context{WorkflowID: "not a number", Args: []string{"-4"}})
+	if err != nil {
+		t.Fatalf("ExpandCmd: %v", err)
+	}
+	if want := `echo $(( ${TEMPO_ARG_1} + 1 )) "${TEMPO_WORKFLOW_ID}"`; inv.Script != want {
+		t.Errorf("script = %q, want %q", inv.Script, want)
 	}
 }
 

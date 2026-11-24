@@ -58,7 +58,10 @@ func (inv *Invocation) setEnv(name, value string) {
 	inv.Env = append(inv.Env, entry)
 }
 
-var placeholderRe = regexp.MustCompile(`^\{([^}]+)\}`)
+var (
+	placeholderRe = regexp.MustCompile(`^\{([^}]+)\}`)
+	integerRe     = regexp.MustCompile(`^[+-]?[0-9]+$`)
+)
 
 // quoteState is the shell quoting in effect at a position in a template.
 type quoteState int
@@ -68,6 +71,37 @@ const (
 	quoteSingle
 	quoteDouble
 )
+
+// contextKind is the kind of shell construct a position in a template sits in.
+type contextKind int
+
+const (
+	contextTop          contextKind = iota
+	contextSubstitution             // $( ... )
+	contextBackticks                // ` ... `
+	contextArithmetic               // $(( ... )) or (( ... ))
+)
+
+// shellContext is one level of shell nesting in a template. Each command
+// substitution and arithmetic expression has its own quoting.
+type shellContext struct {
+	kind  contextKind
+	quote quoteState
+	// parens counts the unclosed parentheses of a substitution or arithmetic
+	// expression; the context ends when it returns to zero.
+	parens int
+}
+
+// withinArithmetic reports whether any enclosing context is an arithmetic
+// expression, where the shell evaluates a value instead of treating it as text.
+func withinArithmetic(contexts []shellContext) bool {
+	for _, c := range contexts {
+		if c.kind == contextArithmetic {
+			return true
+		}
+	}
+	return false
+}
 
 // envReference returns shell source that expands the named environment
 // variable to exactly one word in the given quoting context.
@@ -119,54 +153,129 @@ func resolveVariable(key string, ctx Context) (name, value string, err error) {
 // ExpandCmd prepares a command template for execution, resolving its {var}
 // placeholders from ctx. Each value reaches the command as a single word,
 // whatever characters it contains: the script reads it from an environment
-// variable (TEMPO_WORKFLOW_ID, TEMPO_ARG_1, ...) instead of embedding it. A
-// backslash before "{" keeps the braces literal.
-// Returns an error if a placeholder is unknown or its value is empty.
+// variable (TEMPO_WORKFLOW_ID, TEMPO_ARG_1, ...) instead of embedding it, and
+// the reference is quoted for the position the placeholder is in, including
+// inside command substitutions. Inside $(( )) or (( )) the shell evaluates a
+// value as an expression, so there a value must be an integer. "\{" produces
+// a literal brace in any quoting.
+// Returns an error if a placeholder is unknown, its value is empty, or a
+// value used in arithmetic is not an integer.
 func ExpandCmd(template string, ctx Context) (Invocation, error) {
 	var inv Invocation
 	var script, display strings.Builder
-	quote := quoteNone
+	contexts := []shellContext{{kind: contextTop}}
+	emit := func(s string) {
+		script.WriteString(s)
+		display.WriteString(s)
+	}
 
 	for i := 0; i < len(template); {
+		cur := &contexts[len(contexts)-1]
 		c := template[i]
+		rest := template[i:]
+
+		if strings.HasPrefix(rest, `\{`) {
+			// Unquoted, the shell needs the backslash to keep the brace literal.
+			if cur.quote == quoteNone {
+				script.WriteString(`\{`)
+			} else {
+				script.WriteByte('{')
+			}
+			display.WriteByte('{')
+			i += 2
+			continue
+		}
 
 		if c == '{' {
-			if match := placeholderRe.FindStringSubmatch(template[i:]); match != nil {
+			if match := placeholderRe.FindStringSubmatch(rest); match != nil {
 				name, value, err := resolveVariable(match[1], ctx)
 				if err != nil {
 					return Invocation{}, err
 				}
+				reference := envReference(name, cur.quote)
+				if withinArithmetic(contexts) {
+					if !integerRe.MatchString(value) {
+						return Invocation{}, fmt.Errorf("variable {%s} must be an integer inside an arithmetic expression", match[1])
+					}
+					if cur.kind == contextArithmetic {
+						reference = "${" + name + "}"
+					}
+				}
 				inv.setEnv(name, value)
-				script.WriteString(envReference(name, quote))
+				script.WriteString(reference)
 				display.WriteString(value)
 				i += len(match[0])
 				continue
 			}
 		}
 
-		// A backslash outside single quotes escapes the next character, so
-		// that character neither opens nor closes a quote.
-		if c == '\\' && quote != quoteSingle && i+1 < len(template) {
-			script.WriteString(template[i : i+2])
-			display.WriteString(template[i : i+2])
+		if cur.quote == quoteSingle {
+			if c == '\'' {
+				cur.quote = quoteNone
+			}
+			emit(rest[:1])
+			i++
+			continue
+		}
+
+		// Outside single quotes a backslash escapes the next character, so that
+		// character neither opens nor closes anything.
+		if c == '\\' && len(rest) > 1 {
+			emit(rest[:2])
 			i += 2
 			continue
 		}
 
+		// Substitutions and arithmetic start unquoted or inside double quotes.
 		switch {
-		case c == '\'' && quote == quoteNone:
-			quote = quoteSingle
-		case c == '\'' && quote == quoteSingle:
-			quote = quoteNone
-		case c == '"' && quote == quoteNone:
-			quote = quoteDouble
-		case c == '"' && quote == quoteDouble:
-			quote = quoteNone
+		case strings.HasPrefix(rest, "$(("):
+			contexts = append(contexts, shellContext{kind: contextArithmetic, parens: 2})
+			emit("$((")
+			i += 3
+			continue
+		case strings.HasPrefix(rest, "$("):
+			contexts = append(contexts, shellContext{kind: contextSubstitution, parens: 1})
+			emit("$(")
+			i += 2
+			continue
+		case c == '`':
+			if cur.kind == contextBackticks {
+				contexts = contexts[:len(contexts)-1]
+			} else {
+				contexts = append(contexts, shellContext{kind: contextBackticks})
+			}
+			emit("`")
+			i++
+			continue
 		}
 
-		script.WriteByte(c)
-		display.WriteByte(c)
+		closes := false
+		switch {
+		case c == '"' && cur.quote == quoteDouble:
+			cur.quote = quoteNone
+		case cur.quote == quoteDouble:
+			// Everything else is literal inside double quotes.
+		case c == '"':
+			cur.quote = quoteDouble
+		case c == '\'':
+			cur.quote = quoteSingle
+		case strings.HasPrefix(rest, "((") && cur.kind != contextArithmetic:
+			contexts = append(contexts, shellContext{kind: contextArithmetic, parens: 2})
+			emit("((")
+			i += 2
+			continue
+		case c == '(' && cur.parens > 0:
+			cur.parens++
+		case c == ')' && cur.parens > 0:
+			cur.parens--
+			closes = cur.parens == 0
+		}
+
+		emit(rest[:1])
 		i++
+		if closes {
+			contexts = contexts[:len(contexts)-1]
+		}
 	}
 
 	inv.Script = script.String()
