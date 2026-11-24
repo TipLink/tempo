@@ -161,16 +161,6 @@ func TestExpandCmdRejectsUnresolvedPlaceholders(t *testing.T) {
 // data, in every quoting context the template can put it in.
 func TestRunNeverExecutesSubstitutedValues(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "executed")
-	// Each value is a complete injection for at least one quoting context when
-	// pasted into shell source.
-	hostileValues := map[string]string{
-		"command substitution": "$(touch " + marker + ")",
-		"backticks":            "`touch " + marker + "`",
-		"command separator":    "x; touch " + marker,
-		"closes single quote":  "x'; touch " + marker + "; '",
-		"closes double quote":  `x"; touch ` + marker + `; "`,
-	}
-
 	templates := []struct {
 		name     string
 		template string
@@ -187,7 +177,7 @@ func TestRunNeverExecutesSubstitutedValues(t *testing.T) {
 	}
 
 	for _, tt := range templates {
-		for valueName, hostile := range hostileValues {
+		for valueName, hostile := range hostilePayloads(marker) {
 			t.Run(tt.name+"/"+valueName, func(t *testing.T) {
 				inv, err := ExpandCmd(tt.template, Context{WorkflowID: hostile, Args: []string{hostile}})
 				if err != nil {
@@ -362,5 +352,183 @@ func TestInjectConnectionFlagsLeavesOtherCommandsAlone(t *testing.T) {
 
 	if !reflect.DeepEqual(inv, before) {
 		t.Errorf("invocation = %+v, want %+v", inv, before)
+	}
+}
+
+// hostilePayloads returns values that are each a complete injection for at
+// least one quoting context when pasted into shell source.
+func hostilePayloads(marker string) map[string]string {
+	return map[string]string{
+		"command substitution": "$(touch " + marker + ")",
+		"backticks":            "`touch " + marker + "`",
+		"command separator":    "x; touch " + marker,
+		"closes single quote":  "x'; touch " + marker + "; '",
+		"closes double quote":  `x"; touch ` + marker + `; "`,
+	}
+}
+
+func TestExpandCmdHandlesCommentsHeredocsAndLiteralBraces(t *testing.T) {
+	ctx := Context{WorkflowID: "order-42", Namespace: "payments", Args: []string{"2"}}
+
+	tests := []struct {
+		name     string
+		template string
+		script   string
+		// output is what the command prints; empty skips running it.
+		output string
+	}{
+		{
+			name:     "apostrophe in a comment line",
+			template: "# don't modify\nprintf '%s' {workflow_id}",
+			script:   "# don't modify\nprintf '%s' \"${TEMPO_WORKFLOW_ID}\"",
+			output:   "order-42",
+		},
+		{
+			name:     "trailing comment",
+			template: "printf '%s' {workflow_id} # it's {not_a_variable}",
+			script:   "printf '%s' \"${TEMPO_WORKFLOW_ID}\" # it's {not_a_variable}",
+			output:   "order-42",
+		},
+		{
+			name:     "hash inside a word or a quote is not a comment",
+			template: `printf '%s' a#b "# it's" '{workflow_id}'`,
+			script:   `printf '%s' a#b "# it's" ''"${TEMPO_WORKFLOW_ID}"''`,
+			output:   "a#b# it'sorder-42",
+		},
+		{
+			name:     "here-document body",
+			template: "cat <<EOF\n\"{workflow_id}\" isn't {namespace}\nEOF\nprintf '%s' {namespace}",
+			script:   "cat <<EOF\n\"${TEMPO_WORKFLOW_ID}\" isn't ${TEMPO_NAMESPACE}\nEOF\nprintf '%s' \"${TEMPO_NAMESPACE}\"",
+			output:   "\"order-42\" isn't payments\npayments",
+		},
+		{
+			name:     "here-document with stripped tabs",
+			template: "cat <<-END\n\t{workflow_id}\n\tEND\nprintf '%s' '{namespace}'",
+			script:   "cat <<-END\n\t${TEMPO_WORKFLOW_ID}\n\tEND\nprintf '%s' ''\"${TEMPO_NAMESPACE}\"''",
+			output:   "order-42\npayments",
+		},
+		{
+			name:     "arithmetic in a here-document body",
+			template: "cat <<EOF\n$(( {1} + 1 ))\nEOF\n",
+			script:   "cat <<EOF\n$(( ${TEMPO_ARG_1} + 1 ))\nEOF\n",
+			output:   "3\n",
+		},
+		{
+			name:     "shift operator is not a here-document",
+			template: "echo $(( 1 << {1} ))\nprintf '%s' {workflow_id}",
+			script:   "echo $(( 1 << ${TEMPO_ARG_1} ))\nprintf '%s' \"${TEMPO_WORKFLOW_ID}\"",
+			output:   "4\norder-42",
+		},
+		{
+			name:     "here-string is an ordinary word",
+			template: `cat <<<{workflow_id}`,
+			script:   `cat <<<"${TEMPO_WORKFLOW_ID}"`,
+		},
+		{
+			name:     "escaped brace after a dollar sign in double quotes",
+			template: `printf '%s' "$\{HOME} \{x}"`,
+			script:   `printf '%s' "\${HOME} {x}"`,
+			output:   "${HOME} {x}",
+		},
+		{
+			name:     "escaped brace after a dollar sign unquoted",
+			template: `printf '%s' $\{HOME}`,
+			script:   `printf '%s' \$\{HOME}`,
+			output:   "${HOME}",
+		},
+		{
+			name:     "escaped brace after a dollar sign in single quotes",
+			template: `printf '%s' '$\{HOME}'`,
+			script:   `printf '%s' '${HOME}'`,
+			output:   "${HOME}",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inv, err := ExpandCmd(tt.template, ctx)
+			if err != nil {
+				t.Fatalf("ExpandCmd: %v", err)
+			}
+			if inv.Script != tt.script {
+				t.Errorf("script = %q, want %q", inv.Script, tt.script)
+			}
+			if tt.output == "" {
+				return
+			}
+			out, err := Run(context.Background(), inv)
+			if err != nil {
+				t.Fatalf("Run: %v\n%s", err, out)
+			}
+			if out != tt.output {
+				t.Errorf("output = %q, want %q", out, tt.output)
+			}
+		})
+	}
+}
+
+// The shell expands nothing in a here-document whose delimiter is quoted, so
+// a value cannot be delivered there.
+func TestExpandCmdRejectsPlaceholdersInLiteralHeredocs(t *testing.T) {
+	ctx := Context{WorkflowID: "order-42"}
+
+	for _, template := range []string{
+		"cat <<'EOF'\n{workflow_id}\nEOF",
+		"cat <<\"EOF\"\n{workflow_id}\nEOF",
+		"cat <<\\EOF\n{workflow_id}\nEOF",
+	} {
+		_, err := ExpandCmd(template, ctx)
+		want := "variable {workflow_id} cannot be used in a here-document with a quoted delimiter"
+		if err == nil || err.Error() != want {
+			t.Errorf("template %q: error = %v, want %q", template, err, want)
+		}
+	}
+
+	inv, err := ExpandCmd("cat <<'EOF'\n\\{literal} $(not run)\nEOF\nprintf '%s' {workflow_id}", ctx)
+	if err != nil {
+		t.Fatalf("ExpandCmd: %v", err)
+	}
+	out, err := Run(context.Background(), inv)
+	if err != nil {
+		t.Fatalf("Run: %v\n%s", err, out)
+	}
+	if want := "{literal} $(not run)\norder-42"; out != want {
+		t.Errorf("output = %q, want %q", out, want)
+	}
+}
+
+func TestRunNeverExecutesValuesInHeredocsOrAfterComments(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "executed")
+
+	templates := []struct {
+		name     string
+		template string
+		// suffix is what the command prints after the value.
+		suffix string
+	}{
+		{"here-document body", "cat <<EOF\n{workflow_id}\nEOF\n", "\n"},
+		{"substitution in a here-document body", "cat <<EOF\n$(printf '%s' {workflow_id})\nEOF\n", "\n"},
+		{"after a comment with an apostrophe", "# don't modify\nprintf '%s' {workflow_id}", ""},
+	}
+
+	for _, tt := range templates {
+		for valueName, hostile := range hostilePayloads(marker) {
+			t.Run(tt.name+"/"+valueName, func(t *testing.T) {
+				inv, err := ExpandCmd(tt.template, Context{WorkflowID: hostile})
+				if err != nil {
+					t.Fatalf("ExpandCmd: %v", err)
+				}
+				out, err := Run(context.Background(), inv)
+				if err != nil {
+					t.Fatalf("Run: %v\n%s", err, out)
+				}
+				if _, statErr := os.Stat(marker); statErr == nil {
+					t.Fatalf("value was executed as shell code; output: %q", out)
+				}
+				if want := hostile + tt.suffix; out != want {
+					t.Errorf("output = %q, want %q", out, want)
+				}
+			})
+		}
 	}
 }

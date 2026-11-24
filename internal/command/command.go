@@ -70,6 +70,12 @@ const (
 	quoteNone quoteState = iota
 	quoteSingle
 	quoteDouble
+	// quoteHeredoc is the body of a here-document: the shell expands
+	// variables and substitutions there, and quote characters are literal.
+	quoteHeredoc
+	// quoteHeredocLiteral is the body of a here-document whose delimiter is
+	// quoted: the shell expands nothing there.
+	quoteHeredocLiteral
 )
 
 // contextKind is the kind of shell construct a position in a template sits in.
@@ -80,16 +86,83 @@ const (
 	contextSubstitution             // $( ... )
 	contextBackticks                // ` ... `
 	contextArithmetic               // $(( ... )) or (( ... ))
+	contextHeredoc                  // the body of a here-document
 )
 
+// heredoc is a here-document announced on a command line. Its body starts
+// after the next newline and ends at a line holding only the delimiter.
+type heredoc struct {
+	delimiter string
+	// quoted reports a quoted delimiter, which makes the body literal.
+	quoted bool
+	// stripTabs reports the <<- form, which ignores leading tabs.
+	stripTabs bool
+}
+
+// terminates reports whether line ends the here-document body.
+func (h heredoc) terminates(line string) bool {
+	if h.stripTabs {
+		line = strings.TrimLeft(line, "\t")
+	}
+	return line == h.delimiter
+}
+
+// parseHeredoc reads a here-document operator and its delimiter from the
+// start of rest, returning how many bytes they span. It reports false when
+// rest does not start a here-document.
+func parseHeredoc(rest string) (h heredoc, consumed int, ok bool) {
+	j := len("<<")
+	if j < len(rest) && rest[j] == '-' {
+		h.stripTabs = true
+		j++
+	}
+	for j < len(rest) && (rest[j] == ' ' || rest[j] == '\t') {
+		j++
+	}
+
+	var word strings.Builder
+scan:
+	for j < len(rest) {
+		ch := rest[j]
+		switch {
+		case ch == '\'' || ch == '"':
+			end := strings.IndexByte(rest[j+1:], ch)
+			if end < 0 {
+				return heredoc{}, 0, false
+			}
+			h.quoted = true
+			word.WriteString(rest[j+1 : j+1+end])
+			j += end + 2
+		case ch == '\\' && j+1 < len(rest):
+			h.quoted = true
+			word.WriteByte(rest[j+1])
+			j += 2
+		case strings.IndexByte(" \t\n;|&<>()", ch) >= 0:
+			break scan
+		default:
+			word.WriteByte(ch)
+			j++
+		}
+	}
+
+	h.delimiter = word.String()
+	if h.delimiter == "" {
+		return heredoc{}, 0, false
+	}
+	return h, j, true
+}
+
 // shellContext is one level of shell nesting in a template. Each command
-// substitution and arithmetic expression has its own quoting.
+// substitution, arithmetic expression, and here-document body has its own
+// quoting.
 type shellContext struct {
 	kind  contextKind
 	quote quoteState
 	// parens counts the unclosed parentheses of a substitution or arithmetic
 	// expression; the context ends when it returns to zero.
 	parens int
+	// heredoc describes the here-document whose body this context is.
+	heredoc heredoc
 }
 
 // withinArithmetic reports whether any enclosing context is an arithmetic
@@ -103,16 +176,44 @@ func withinArithmetic(contexts []shellContext) bool {
 	return false
 }
 
+// startsWord reports whether position i of template begins a shell word,
+// which is where "#" opens a comment.
+func startsWord(template string, i int) bool {
+	return i == 0 || strings.IndexByte(" \t\n;&|()", template[i-1]) >= 0
+}
+
 // envReference returns shell source that expands the named environment
 // variable to exactly one word in the given quoting context.
 func envReference(name string, quote quoteState) string {
 	switch quote {
-	case quoteDouble:
+	case quoteDouble, quoteHeredoc:
 		return "${" + name + "}"
 	case quoteSingle:
 		return `'"${` + name + `}"'`
 	default:
 		return `"${` + name + `}"`
+	}
+}
+
+// literalBrace returns shell source for an opening brace the shell must take
+// as text, preceded by a literal dollar sign when dollar is set.
+func literalBrace(dollar bool, quote quoteState) string {
+	switch quote {
+	case quoteNone:
+		if dollar {
+			return `\$\{`
+		}
+		return `\{`
+	case quoteDouble, quoteHeredoc:
+		if dollar {
+			return `\${`
+		}
+		return "{"
+	default:
+		if dollar {
+			return "${"
+		}
+		return "{"
 	}
 }
 
@@ -154,16 +255,19 @@ func resolveVariable(key string, ctx Context) (name, value string, err error) {
 // placeholders from ctx. Each value reaches the command as a single word,
 // whatever characters it contains: the script reads it from an environment
 // variable (TEMPO_WORKFLOW_ID, TEMPO_ARG_1, ...) instead of embedding it, and
-// the reference is quoted for the position the placeholder is in, including
-// inside command substitutions. Inside $(( )) or (( )) the shell evaluates a
-// value as an expression, so there a value must be an integer. "\{" produces
-// a literal brace in any quoting.
-// Returns an error if a placeholder is unknown, its value is empty, or a
-// value used in arithmetic is not an integer.
+// the reference is written for the position the placeholder is in: unquoted,
+// quoted, inside a command substitution, or in a here-document body. Inside
+// $(( )) or (( )) the shell evaluates a value as an expression, so there a
+// value must be an integer. "\{" produces a literal brace and "$\{" a literal
+// "${" in any quoting.
+// Returns an error if a placeholder is unknown, its value is empty, a value
+// used in arithmetic is not an integer, or a placeholder sits in a
+// here-document whose delimiter is quoted.
 func ExpandCmd(template string, ctx Context) (Invocation, error) {
 	var inv Invocation
 	var script, display strings.Builder
 	contexts := []shellContext{{kind: contextTop}}
+	var pending []heredoc
 	emit := func(s string) {
 		script.WriteString(s)
 		display.WriteString(s)
@@ -174,12 +278,24 @@ func ExpandCmd(template string, ctx Context) (Invocation, error) {
 		c := template[i]
 		rest := template[i:]
 
-		if strings.HasPrefix(rest, `\{`) {
-			// Unquoted, the shell needs the backslash to keep the brace literal.
-			if cur.quote == quoteNone {
-				script.WriteString(`\{`)
-			} else {
-				script.WriteByte('{')
+		if cur.kind == contextHeredoc && template[i-1] == '\n' {
+			line := rest
+			if end := strings.IndexByte(rest, '\n'); end >= 0 {
+				line = rest[:end]
+			}
+			if cur.heredoc.terminates(line) {
+				emit(line)
+				i += len(line)
+				contexts = contexts[:len(contexts)-1]
+				continue
+			}
+		}
+
+		if dollar := strings.HasPrefix(rest, `$\{`); dollar || strings.HasPrefix(rest, `\{`) {
+			script.WriteString(literalBrace(dollar, cur.quote))
+			if dollar {
+				display.WriteByte('$')
+				i++
 			}
 			display.WriteByte('{')
 			i += 2
@@ -191,6 +307,9 @@ func ExpandCmd(template string, ctx Context) (Invocation, error) {
 				name, value, err := resolveVariable(match[1], ctx)
 				if err != nil {
 					return Invocation{}, err
+				}
+				if cur.quote == quoteHeredocLiteral {
+					return Invocation{}, fmt.Errorf("variable {%s} cannot be used in a here-document with a quoted delimiter", match[1])
 				}
 				reference := envReference(name, cur.quote)
 				if withinArithmetic(contexts) {
@@ -209,8 +328,9 @@ func ExpandCmd(template string, ctx Context) (Invocation, error) {
 			}
 		}
 
-		if cur.quote == quoteSingle {
-			if c == '\'' {
+		// Nothing is special in single quotes or a literal here-document.
+		if cur.quote == quoteSingle || cur.quote == quoteHeredocLiteral {
+			if c == '\'' && cur.quote == quoteSingle {
 				cur.quote = quoteNone
 			}
 			emit(rest[:1])
@@ -218,15 +338,16 @@ func ExpandCmd(template string, ctx Context) (Invocation, error) {
 			continue
 		}
 
-		// Outside single quotes a backslash escapes the next character, so that
-		// character neither opens nor closes anything.
+		// Elsewhere a backslash escapes the next character, so that character
+		// neither opens nor closes anything.
 		if c == '\\' && len(rest) > 1 {
 			emit(rest[:2])
 			i += 2
 			continue
 		}
 
-		// Substitutions and arithmetic start unquoted or inside double quotes.
+		// Substitutions and arithmetic start unquoted, inside double quotes,
+		// and in here-document bodies.
 		switch {
 		case strings.HasPrefix(rest, "$(("):
 			contexts = append(contexts, shellContext{kind: contextArithmetic, parens: 2})
@@ -249,16 +370,52 @@ func ExpandCmd(template string, ctx Context) (Invocation, error) {
 			continue
 		}
 
+		// Everything else is literal in a here-document body and, apart from
+		// the closing quote, inside double quotes.
+		if cur.quote == quoteHeredoc || cur.quote == quoteDouble {
+			if c == '"' && cur.quote == quoteDouble {
+				cur.quote = quoteNone
+			}
+			emit(rest[:1])
+			i++
+			continue
+		}
+
 		closes := false
 		switch {
-		case c == '"' && cur.quote == quoteDouble:
-			cur.quote = quoteNone
-		case cur.quote == quoteDouble:
-			// Everything else is literal inside double quotes.
 		case c == '"':
 			cur.quote = quoteDouble
 		case c == '\'':
 			cur.quote = quoteSingle
+		case c == '#' && startsWord(template, i):
+			end := strings.IndexByte(rest, '\n')
+			if end < 0 {
+				end = len(rest)
+			}
+			emit(rest[:end])
+			i += end
+			continue
+		case strings.HasPrefix(rest, "<<<"):
+			emit("<<<")
+			i += 3
+			continue
+		case strings.HasPrefix(rest, "<<") && cur.kind != contextArithmetic:
+			if h, consumed, ok := parseHeredoc(rest); ok {
+				pending = append(pending, h)
+				emit(rest[:consumed])
+				i += consumed
+				continue
+			}
+		case c == '\n' && len(pending) > 0:
+			body := shellContext{kind: contextHeredoc, quote: quoteHeredoc, heredoc: pending[0]}
+			if pending[0].quoted {
+				body.quote = quoteHeredocLiteral
+			}
+			pending = pending[1:]
+			contexts = append(contexts, body)
+			emit("\n")
+			i++
+			continue
 		case strings.HasPrefix(rest, "((") && cur.kind != contextArithmetic:
 			contexts = append(contexts, shellContext{kind: contextArithmetic, parens: 2})
 			emit("((")
